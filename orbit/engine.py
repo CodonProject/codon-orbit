@@ -1,9 +1,10 @@
 import torch
 from contextlib import nullcontext
+from typing import Union, List, Callable, Any, Dict, Generator, Optional, Type
 
 from .utils import process_batch_data
 from .event import Event, EventBroker
-from typing import Union, List, Callable, Any, Dict, Generator, Optional, Type
+from .plugins.recorder import RecorderHub
 
 from dataclasses import dataclass
 
@@ -52,6 +53,7 @@ class Engine:
             'criterion': [],
         }
         self._plugins: List[Any] = []
+        self._recorder: RecorderHub = RecorderHub(self)
 
         self.mode = 'train'
 
@@ -62,6 +64,67 @@ class Engine:
     @property
     def plugins(self) -> List[Any]:
         return list(self._plugins)
+    
+    @property
+    def recorder(self) -> RecorderHub:
+        return self._recorder
+    
+    def set_recorder(
+        self,
+        path: str = '',
+        name: str = '',
+        resume: bool = False,
+        auto_restore: bool = True,
+        **kwargs
+    ) -> 'Engine':
+        '''
+        Initialize and configure the recorder.
+
+        Args:
+            path (str): Custom root path for recordings.
+            name (str): Experiment name.
+            resume (bool): Whether to resume from existing recording.
+            auto_restore (bool): Whether to auto-restore last checkpoint if available.
+            **kwargs: Additional configuration options.
+
+        Returns:
+            Engine: Self for method chaining.
+        '''
+        self._recorder.set_recorder(path=path, name=name, resume=resume, **kwargs)
+        
+        if auto_restore:
+            latest_ckpt = self._recorder.get_latest_checkpoint()
+            if latest_ckpt is not None:
+                state = self._recorder.load_checkpoint(latest_ckpt.name)
+                self._restore_from_checkpoint(state)
+        
+        return self
+    
+    def _restore_from_checkpoint(self, state: Dict[str, Any]) -> None:
+        '''
+        Restore engine state from a checkpoint dictionary.
+
+        Args:
+            state (Dict[str, Any]): The checkpoint state dictionary.
+        '''
+        if 'epoch' in state:
+            self.epoch = state['epoch']
+        if 'step_global' in state:
+            self.step_global = state['step_global']
+        if 'step_micro' in state:
+            self.step_micro = state['step_micro']
+        
+        for space_name, space_data in state.get('spaces', {}).items():
+            if space_name not in self._moc:
+                continue
+            
+            for i, model_state in enumerate(space_data.get('models', [])):
+                if i < len(self._moc[space_name]['model']):
+                    self._moc[space_name]['model'][i].load_state_dict(model_state)
+            
+            for i, opt_state in enumerate(space_data.get('optimizers', [])):
+                if i < len(self._moc[space_name]['optimizer']):
+                    self._moc[space_name]['optimizer'][i].load_state_dict(opt_state)
     
     @property
     def init_specs(self) -> Dict[str, Any]:
@@ -412,3 +475,48 @@ class Engine:
 
             self.emit('after_step')
         self.emit('end_epoch')
+
+    def get_checkpoint_state(self) -> Dict[str, Any]:
+        '''
+        Create a checkpoint state dictionary.
+
+        Returns:
+            Dict[str, Any]: The checkpoint state containing engine state and all models/optimizers.
+        '''
+        spaces_state = {}
+        for space_name, space_data in self._moc.items():
+            spaces_state[space_name] = {
+                'models': [m.state_dict() for m in space_data['model']],
+                'optimizers': [o.state_dict() for o in space_data['optimizer']],
+            }
+        
+        return {
+            'epoch': self.epoch,
+            'step_global': self.step_global,
+            'step_micro': self.step_micro,
+            'spaces': spaces_state,
+        }
+    
+    def save_checkpoint(self, filename: Optional[str] = None) -> Optional[Any]:
+        '''
+        Save a checkpoint using the recorder.
+
+        Args:
+            filename (Optional[str]): Custom filename for the checkpoint.
+
+        Returns:
+            Optional[Path]: Path to the saved checkpoint, or None if recorder is not enabled.
+        '''
+        if not self._recorder.enable:
+            return None
+        self._recorder.flush()
+        state = self.get_checkpoint_state()
+        return self._recorder.save_checkpoint(state, filename)
+    
+    def close(self) -> None:
+        '''
+        Close the engine and flush all pending recorder tasks.
+        '''
+        if self._recorder.enable:
+            self._recorder.flush()
+            self._recorder.close()

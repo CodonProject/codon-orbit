@@ -35,8 +35,12 @@ class Trainer(Engine):
             for _ in self.train(train_loader):
                 self.auto_update()
 
+            if self.recorder.enable:
+                self.save_checkpoint()
+
             if val_loader is None: continue
             for _ in self.eval(val_loader):
                 self.forward_pass()
 
         self.emit('end_run')
+        self.close()
