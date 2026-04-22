@@ -47,9 +47,7 @@ class EventBroker:
         return self
 
     def emit(self, event: Event) -> None:
-        for cb in self._subscribers.get(event.info, ()):
-            cb(event)
+        for cb in self._subscribers.get(event.info, ()): cb(event)
         once = self._once_subscribers.pop(event.info, None)
         if once:
-            for cb in once:
-                cb(event)
+            for cb in once: cb(event)

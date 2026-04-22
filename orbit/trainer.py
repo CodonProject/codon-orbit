@@ -27,9 +27,13 @@ class Trainer(Engine):
         max_epochs: Optional[int] = None,
     ) -> None:
         epochs = max_epochs if max_epochs is not None else self.max_epochs
-        self.emit('start_run', data={'max_epochs': epochs})
+        self.emit('start_run', data={'max_epochs': epochs, 'start_epoch': self.epoch})
 
-        for ep in range(epochs):
+        if self.epoch >= epochs:
+            self.emit('end_run').flush()
+            return
+
+        for ep in range(self.epoch, epochs):
             self.epoch = ep
 
             for _ in self.train(train_loader):
@@ -42,5 +46,4 @@ class Trainer(Engine):
             for _ in self.eval(val_loader):
                 self.forward_pass()
 
-        self.emit('end_run')
-        self.close()
+        self.emit('end_run').flush()

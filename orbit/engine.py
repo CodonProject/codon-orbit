@@ -6,6 +6,8 @@ from .utils import process_batch_data
 from .event import Event, EventBroker
 from .plugins.recorder import RecorderHub
 
+from .utils.lifecycle import exit_manager
+
 from dataclasses import dataclass
 
 @dataclass
@@ -56,6 +58,8 @@ class Engine:
         self._recorder: RecorderHub = RecorderHub(self)
 
         self.mode = 'train'
+
+        exit_manager.register(self._close)
 
     @property
     def is_training(self) -> bool:
@@ -224,13 +228,14 @@ class Engine:
             self._plugins.remove(s)
         return self
 
-    def emit(self, event_name: str, sender: str = 'engine', data: Any = None) -> None:
+    def emit(self, event_name: str, sender: str = 'engine', data: Any = None) -> 'Engine':
         self.broker.emit(Event(
             info=event_name,
             sender=sender,
             data=data,
             engine=self
         ))
+        return self
 
     def add_model(self, model: Union[torch.nn.Module, List[torch.nn.Module]], space: str = 'default') -> 'Engine':
         if space not in self._moc:
@@ -513,10 +518,14 @@ class Engine:
         state = self.get_checkpoint_state()
         return self._recorder.save_checkpoint(state, filename)
     
-    def close(self) -> None:
+    def flush(self) -> 'Engine':
+        if self._recorder.enable: self._recorder.flush()
+        return self
+    
+    def _close(self) -> 'Engine':
         '''
         Close the engine and flush all pending recorder tasks.
         '''
-        if self._recorder.enable:
-            self._recorder.flush()
-            self._recorder.close()
+        self.flush()
+        if self._recorder.enable: self._recorder.close()
+        return self

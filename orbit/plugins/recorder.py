@@ -4,12 +4,13 @@ import shutil
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
 import torch
 
 if TYPE_CHECKING:
     from ..engine import Engine
+    from ..event  import Event
 
 
 class _AsyncWriter:
@@ -245,11 +246,11 @@ class RecorderHub:
         '''Get the current step, using engine step if not provided.'''
         if step is not None:
             return step
-        return self._engine.step_global if hasattr(self._engine, 'step_global') else self._current_step
+        return self._engine.step_global
 
     def _get_epoch(self) -> int:
         '''Get the current epoch.'''
-        return self._engine.epoch if hasattr(self._engine, 'epoch') else self._current_epoch
+        return self._engine.epoch
 
     def _write_jsonl(self, file_path: Path, data: Dict[str, Any]) -> None:
         '''Append a JSON line to a jsonl file (thread-safe).'''
@@ -957,7 +958,7 @@ class RecorderHub:
                 except (ValueError, IndexError):
                     continue
 
-    def on_start_run(self, event: Any) -> None:
+    def on_start_run(self, event: 'Event') -> None:
         '''Handle start_run event: dump config.json.'''
         if not self._enable or self._root is None:
             return
@@ -970,17 +971,17 @@ class RecorderHub:
             'path': str(config_path),
         })
 
-    def on_start_epoch(self, event: Any) -> None:
+    def on_start_epoch(self, event: 'Event') -> None:
         '''Handle start_epoch event.'''
         if not self._enable:
             return
         self._current_epoch = event.engine.epoch
 
-    def on_end_epoch(self, event: Any) -> None:
+    def on_end_epoch(self, event: 'Event') -> None:
         '''Handle end_epoch event.'''
         pass
 
-    def on_before_step(self, event: Any) -> None:
+    def on_before_step(self, event: 'Event') -> None:
         '''Handle before_step event.'''
         if not self._enable:
             return
