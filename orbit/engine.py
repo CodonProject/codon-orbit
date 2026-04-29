@@ -4,7 +4,6 @@ from typing import Union, List, Callable, Any, Dict, Generator, Optional, Type
 
 from .utils import process_batch_data
 from .event import Event, EventBroker
-from .plugins.recorder import RecorderHub
 
 from .utils.lifecycle import exit_manager
 
@@ -15,6 +14,7 @@ class Space:
     model: List[torch.nn.Module]
     optimizer: List[torch.optim.Optimizer]
     criterion: List[Callable]
+    schedule: List[Any]
 
 class Engine:
     def __init__(
@@ -33,7 +33,8 @@ class Engine:
             str, Union[
                 List[torch.nn.Module],
                 List[torch.optim.Optimizer],
-                List[Callable]
+                List[Callable],
+                List[Any]
             ]
         ]] = {}
 
@@ -50,16 +51,17 @@ class Engine:
         self.step_global_in_batch: int = 0
 
         self.epoch: int = 0
+        self.is_epoch_finished: bool = False
+        self.is_run_finished: bool = False
         self._init_specs: Dict[str, List[Dict[str, Any]]] = {
             'optimizer': [],
             'criterion': [],
+            'schedule': [],
         }
         self._plugins: List[Any] = []
-        self._recorder: RecorderHub = RecorderHub(self)
 
         self.mode = 'train'
-
-        exit_manager.register(self._close)
+        self.loss: Optional[torch.Tensor] = None
 
     @property
     def is_training(self) -> bool:
@@ -68,10 +70,6 @@ class Engine:
     @property
     def plugins(self) -> List[Any]:
         return list(self._plugins)
-    
-    @property
-    def recorder(self) -> RecorderHub:
-        return self._recorder
     
     def set_recorder(
         self,
@@ -129,6 +127,10 @@ class Engine:
             for i, opt_state in enumerate(space_data.get('optimizers', [])):
                 if i < len(self._moc[space_name]['optimizer']):
                     self._moc[space_name]['optimizer'][i].load_state_dict(opt_state)
+            
+            for i, sch_state in enumerate(space_data.get('schedules', [])):
+                if i < len(self._moc[space_name]['schedule']):
+                    self._moc[space_name]['schedule'][i].load_state_dict(sch_state)
     
     @property
     def init_specs(self) -> Dict[str, Any]:
@@ -145,11 +147,13 @@ class Engine:
                     'models': [m.__class__.__name__ for m in d['model']],
                     'n_optimizers': len(d['optimizer']),
                     'n_criterions': len(d['criterion']),
+                    'n_schedules': len(d['schedule']),
                 }
                 for sp, d in self._moc.items()
             },
             'optimizer': list(self._init_specs['optimizer']),
             'criterion': list(self._init_specs['criterion']),
+            'schedule': list(self._init_specs['schedule']),
         }
 
     def set_models_mode(self, mode: str):
@@ -162,11 +166,12 @@ class Engine:
 
     def space(self, name: str) -> Space:
         if name not in self._moc:
-            self._moc[name] = {'model': [], 'optimizer': [], 'criterion': []}
+            self._moc[name] = {'model': [], 'optimizer': [], 'criterion': [], 'schedule': []}
         return Space(
             model=self._moc[name]['model'],
             optimizer=self._moc[name]['optimizer'],
-            criterion=self._moc[name]['criterion']
+            criterion=self._moc[name]['criterion'],
+            schedule=self._moc[name]['schedule']
         )
     
     def find_plugin(self, target: Union[str, Type]) -> List[Any]:
@@ -237,9 +242,9 @@ class Engine:
         ))
         return self
 
-    def add_model(self, model: Union[torch.nn.Module, List[torch.nn.Module]], space: str = 'default') -> 'Engine':
+    def add_model(self, model: Union[torch.nn.Module, List[torch.nn.Module]], space: str = 'main') -> 'Engine':
         if space not in self._moc:
-            self._moc[space] = {'model': [], 'optimizer': [], 'criterion': []}
+            self._moc[space] = {'model': [], 'optimizer': [], 'criterion': [], 'schedule': []}
         if not isinstance(model, list):
             model = [model]
         for m in model:
@@ -247,9 +252,9 @@ class Engine:
             self._moc[space]['model'].append(m)
         return self
 
-    def add_optimizer(self, optimizer: Union[torch.optim.Optimizer, List[torch.optim.Optimizer]], space: str = 'default') -> 'Engine':
+    def add_optimizer(self, optimizer: Union[torch.optim.Optimizer, List[torch.optim.Optimizer]], space: str = 'main') -> 'Engine':
         if space not in self._moc:
-            self._moc[space] = {'model': [], 'optimizer': [], 'criterion': []}
+            self._moc[space] = {'model': [], 'optimizer': [], 'criterion': [], 'schedule': []}
         if not isinstance(optimizer, list):
             optimizer = [optimizer]
         for o in optimizer:
@@ -257,13 +262,22 @@ class Engine:
                 self._moc[space]['optimizer'].append(o)
         return self
 
-    def add_criterion(self, criterion: Union[Callable, List[Callable]], space: str = 'default') -> 'Engine':
+    def add_criterion(self, criterion: Union[Callable, List[Callable]], space: str = 'main') -> 'Engine':
         if space not in self._moc:
-            self._moc[space] = {'model': [], 'optimizer': [], 'criterion': []}
+            self._moc[space] = {'model': [], 'optimizer': [], 'criterion': [], 'schedule': []}
         if not isinstance(criterion, list):
             criterion = [criterion]
         for c in criterion:
             self._moc[space]['criterion'].append(c)
+        return self
+
+    def add_schedule(self, schedule: Union[Any, List[Any]], space: str = 'main') -> 'Engine':
+        if space not in self._moc:
+            self._moc[space] = {'model': [], 'optimizer': [], 'criterion': [], 'schedule': []}
+        if not isinstance(schedule, list):
+            schedule = [schedule]
+        for s in schedule:
+            self._moc[space]['schedule'].append(s)
         return self
 
     def new_optimizer(
@@ -322,12 +336,60 @@ class Engine:
         self.emit('new_criterion', data=self._init_specs['criterion'][-1])
         return self
     
+    def new_schedule(
+        self,
+        space: str,
+        sch_type: Union[str, Type[Any]],
+        optimizer_index: int = 0,
+        **kwargs,
+    ) -> 'Engine':
+        optimizers = self._moc.get(space, {}).get('optimizer', [])
+        if not optimizers or len(optimizers) <= optimizer_index:
+            raise ValueError(f"space '{space}' 下没有索引为 {optimizer_index} 的 optimizer，无法创建 schedule")
+        
+        opt = optimizers[optimizer_index]
+        
+        if isinstance(sch_type, str):
+            cls = getattr(torch.optim.lr_scheduler, sch_type, None)
+            if cls is None:
+                raise ValueError(f"torch.optim.lr_scheduler 中找不到 '{sch_type}'")
+        else:
+            cls = sch_type
+            
+        schedule = cls(opt, **kwargs)
+        self.add_schedule(schedule, space=space)
+        self._init_specs['schedule'].append({
+            'space': space,
+            'type': cls.__name__,
+            'optimizer_index': optimizer_index,
+            'kwargs': dict(kwargs),
+        })
+        self.emit('new_schedule', data=self._init_specs['schedule'][-1])
+        return self
 
     def to(self, device: str) -> 'Engine':
         self.device = torch.device(device)
         for space in self._moc:
             for i in range(len(self._moc[space]['model'])):
                 self._moc[space]['model'][i] = self._moc[space]['model'][i].to(self.device)
+        return self
+
+    def step_schedules(self, space: Union[str, None] = None) -> 'Engine':
+        '''
+        Steps all registered learning rate schedules.
+
+        Args:
+            space (Optional[str]): If provided, only steps schedules in this space.
+        '''
+        self.emit('start_step_schedules', data={'space': space})
+        target_spaces = [space] if space is not None else list(self._moc.keys())
+        for sp in target_spaces:
+            if sp not in self._moc: continue
+            for sch in self._moc[sp].get('schedule', []):
+                self.emit('before_step_schedule', data={'schedule': sch, 'space': sp})
+                sch.step()
+                self.emit('after_step_schedule', data={'schedule': sch, 'space': sp})
+        self.emit('end_step_schedules', data={'space': space})
         return self
 
     def zero_grad(self, space: Union[str, None] = None) -> 'Engine':
@@ -384,7 +446,7 @@ class Engine:
         self.data, self.target = process_batch_data(batch, self.device)
         self.emit('end_process_batch_data')
 
-    def update_loss(self, loss: Union[torch.Tensor, dict], space: str = 'default') -> 'Engine':
+    def update_loss(self, loss: Union[torch.Tensor, dict], space: str = 'main') -> 'Engine':
         if isinstance(loss, dict):
             for sp, res in loss.items():
                 losses = res.get('losses', [])
@@ -428,6 +490,7 @@ class Engine:
                 for criterion in self._moc[sp]['criterion']:
                     self.emit('before_criterion', data={'criterion': criterion, 'space': sp})
                     loss = criterion(x, self.target)
+                    self.loss = loss
                     losses.append(loss)
                     self.emit('after_criterion', data={'criterion': criterion, 'space': sp, 'loss': loss})
 
@@ -473,12 +536,18 @@ class Engine:
             yield
             self.emit('after_yield')
 
+            if self.is_epoch_finished or self.is_run_finished:
+                break
+
             if self.is_training and self.step_micro % self.accumulate_grad_batches == 0:
                 self.step_global += 1
                 self.step_global_in_batch += 1
             self.step_if_ready()
 
             self.emit('after_step')
+
+            if self.is_epoch_finished or self.is_run_finished:
+                break
         self.emit('end_epoch')
 
     def get_checkpoint_state(self) -> Dict[str, Any]:
@@ -493,6 +562,7 @@ class Engine:
             spaces_state[space_name] = {
                 'models': [m.state_dict() for m in space_data['model']],
                 'optimizers': [o.state_dict() for o in space_data['optimizer']],
+                'schedules': [s.state_dict() for s in space_data.get('schedule', []) if hasattr(s, 'state_dict')],
             }
         
         return {
@@ -501,31 +571,3 @@ class Engine:
             'step_micro': self.step_micro,
             'spaces': spaces_state,
         }
-    
-    def save_checkpoint(self, filename: Optional[str] = None) -> Optional[Any]:
-        '''
-        Save a checkpoint using the recorder.
-
-        Args:
-            filename (Optional[str]): Custom filename for the checkpoint.
-
-        Returns:
-            Optional[Path]: Path to the saved checkpoint, or None if recorder is not enabled.
-        '''
-        if not self._recorder.enable:
-            return None
-        self._recorder.flush()
-        state = self.get_checkpoint_state()
-        return self._recorder.save_checkpoint(state, filename)
-    
-    def flush(self) -> 'Engine':
-        if self._recorder.enable: self._recorder.flush()
-        return self
-    
-    def _close(self) -> 'Engine':
-        '''
-        Close the engine and flush all pending recorder tasks.
-        '''
-        self.flush()
-        if self._recorder.enable: self._recorder.close()
-        return self

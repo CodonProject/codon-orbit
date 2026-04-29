@@ -1,3 +1,5 @@
-from .recorder import RecorderHub
+from .progress import RichProgressBar
 
-__all__ = ['RecorderHub']
+__all__ = [
+    'RichProgressBar',
+]

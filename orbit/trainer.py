@@ -4,9 +4,8 @@ from .engine import Engine
 
 
 class Trainer(Engine):
-    def __init__(self, max_epochs: int = 1, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.max_epochs = max_epochs
 
     def _loop(self, dataloader: torch.utils.data.DataLoader, mode: str) -> Generator:
         self.set_models_mode(mode)
@@ -20,30 +19,76 @@ class Trainer(Engine):
     def eval(self, dataloader: torch.utils.data.DataLoader) -> Generator:
         yield from self._loop(dataloader, 'eval')
 
+    def auto_train(self, dataloader: torch.utils.data.DataLoader, space: Optional[str] = None) -> None:
+        '''
+        Automatically runs the training loop for one epoch and performs parameter updates.
+
+        Args:
+            dataloader (torch.utils.data.DataLoader): The dataloader for training data.
+            space (Optional[str]): Target space to update. Default is None (all spaces).
+        '''
+        for _ in self.train(dataloader):
+            self.auto_update(space=space)
+
+    def auto_eval(self, dataloader: torch.utils.data.DataLoader, space: Optional[str] = None) -> None:
+        '''
+        Automatically runs the evaluation loop for one epoch.
+
+        Args:
+            dataloader (torch.utils.data.DataLoader): The dataloader for evaluation data.
+            space (Optional[str]): Target space to forward pass. Default is None (all spaces).
+        '''
+        for _ in self.eval(dataloader):
+            self.forward_pass(space=space)
+
+    def run_loop(
+        self,
+        max_epochs: int,
+        start_epoch: int = 0
+    ) -> Generator[int, None, None]:
+        '''
+        A generator that manages the outer training loop, emitting run events 
+        and yielding the current epoch number.
+
+        Args:
+            max_epochs (int): The maximum number of epochs to run.
+            start_epoch (int): The starting epoch number (default: 0).
+
+        Yields:
+            int: The current epoch number.
+        '''
+        self.emit('start_run', data={'max_epochs': max_epochs, 'start_epoch': start_epoch})
+        self.is_run_finished = False
+        self.epoch = start_epoch
+
+        while not getattr(self, 'is_run_finished', False) and self.epoch < max_epochs:
+            self.is_epoch_finished = False
+
+            yield self.epoch
+
+            self.step_schedules()
+            self.epoch += 1
+
+        self.emit('end_run')
+
     def run(
         self,
         train_loader: torch.utils.data.DataLoader,
         val_loader: Optional[torch.utils.data.DataLoader] = None,
-        max_epochs: Optional[int] = None,
     ) -> None:
-        epochs = max_epochs if max_epochs is not None else self.max_epochs
-        self.emit('start_run', data={'max_epochs': epochs, 'start_epoch': self.epoch})
+        self.emit('start_run', data={'start_epoch': self.epoch})
 
-        if self.epoch >= epochs:
-            self.emit('end_run').flush()
-            return
+        self.is_run_finished = False
 
-        for ep in range(self.epoch, epochs):
-            self.epoch = ep
+        while not getattr(self, 'is_run_finished', False):
+            self.is_epoch_finished = False
 
-            for _ in self.train(train_loader):
-                self.auto_update()
+            self.auto_train(train_loader)
 
-            if self.recorder.enable:
-                self.save_checkpoint()
+            if val_loader is not None:
+                self.auto_eval(val_loader)
 
-            if val_loader is None: continue
-            for _ in self.eval(val_loader):
-                self.forward_pass()
+            self.step_schedules()
+            self.epoch += 1
 
-        self.emit('end_run').flush()
+        self.emit('end_run')
