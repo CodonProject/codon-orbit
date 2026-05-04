@@ -460,6 +460,7 @@ class Engine:
             self.emit('before_update_loss', data={'loss': loss, 'space': space})
             self.scaler.scale(loss).backward()
             self.emit('after_update_loss', data={'loss': loss, 'space': space})
+            self.loss = loss
         return self
 
     def forward_pass(self, space: Union[str, None] = None) -> dict:
@@ -532,6 +533,7 @@ class Engine:
             self.step_micro_in_batch = step
             if self.is_training:
                 self.step_micro += 1
+            self.zero_grad()
             self.emit('before_yield')
             yield
             self.emit('after_yield')

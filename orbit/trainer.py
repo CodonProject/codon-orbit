@@ -4,9 +4,6 @@ from .engine import Engine
 
 
 class Trainer(Engine):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
     def _loop(self, dataloader: torch.utils.data.DataLoader, mode: str) -> Generator:
         self.set_models_mode(mode)
         self.emit(f'start_{mode}_epoch', data={'epoch': self.epoch})
