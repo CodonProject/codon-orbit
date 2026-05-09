@@ -41,7 +41,7 @@ class RichProgressBar:
             TaskProgressColumn(),
             TextColumn('|'),
             TimeRemainingColumn(),
-            expand=True
+            expand=False
         )
         self.live: Optional[Live] = None
         self.main_task_id: Optional[int] = None

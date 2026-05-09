@@ -552,7 +552,7 @@ class Engine:
                 break
         self.emit('end_epoch')
 
-    def get_checkpoint_state(self) -> Dict[str, Any]:
+    def state_dict(self) -> Dict[str, Any]:
         '''
         Create a checkpoint state dictionary.
 
