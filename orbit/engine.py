@@ -1,8 +1,13 @@
+import os
 import torch
-from contextlib import nullcontext
+from contextlib import nullcontext, ExitStack
 from typing import Union, List, Callable, Any, Dict, Generator, Optional, Type
 
-from .utils import process_batch_data
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data.distributed import DistributedSampler
+
+from .utils import process_batch_data, DistributedContext
 from .event import Event, EventBroker
 
 from .utils.lifecycle import exit_manager
@@ -22,12 +27,30 @@ class Engine:
         accumulate_grad_batches: int = 1,
         precision: str = '32',
         clip_grad: bool = False,
-        clip_max_norm: float = 1.0
+        clip_max_norm: float = 1.0,
+        distributed: Union[bool, str] = 'auto',
+        backend: str = 'nccl',
+        sync_bn: bool = False,
+        find_unused_parameters: bool = False,
+        ddp_kwargs: Optional[Dict[str, Any]] = None,
     ):
         self.accumulate_grad_batches = accumulate_grad_batches
         self.precision = precision
         self.clip_grad = clip_grad
         self.clip_max_norm = clip_max_norm
+
+        self.sync_bn = sync_bn
+        self.find_unused_parameters = find_unused_parameters
+        self.ddp_kwargs: Dict[str, Any] = dict(ddp_kwargs) if ddp_kwargs else {}
+
+        if isinstance(distributed, str):
+            if distributed != 'auto':
+                raise ValueError(f"distributed must be a bool or 'auto', got '{distributed}'")
+            distributed_enabled = int(os.environ.get('WORLD_SIZE', '1')) > 1
+        else:
+            distributed_enabled = bool(distributed)
+
+        self.dist: Optional[DistributedContext] = DistributedContext(backend=backend) if distributed_enabled else None
 
         self._moc: Dict[str, Dict[
             str, Union[
@@ -38,7 +61,11 @@ class Engine:
             ]
         ]] = {}
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if self.dist is not None and self.dist.enabled:
+            self.device = self.dist.device
+        else:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
         self.scaler = torch.amp.GradScaler(enabled=(self.precision == '16' and self.device.type == 'cuda'))
         self.broker = EventBroker()
 
@@ -59,6 +86,8 @@ class Engine:
             'schedule': [],
         }
         self._plugins: List[Any] = []
+        self._ddp_wrapped: bool = False
+        self._prepared_loaders: Dict[int, DataLoader] = {}
 
         self.mode = 'train'
         self.loss: Optional[torch.Tensor] = None
@@ -66,41 +95,23 @@ class Engine:
     @property
     def is_training(self) -> bool:
         return self.mode == 'train'
-    
+
+    @property
+    def is_main_process(self) -> bool:
+        '''
+        True for rank 0 in distributed mode, always True in single-process mode.
+        '''
+        if self.dist is None:
+            return True
+        return self.dist.is_main_process
+
+    @property
+    def is_distributed(self) -> bool:
+        return self.dist is not None and self.dist.enabled
+
     @property
     def plugins(self) -> List[Any]:
         return list(self._plugins)
-    
-    def set_recorder(
-        self,
-        path: str = '',
-        name: str = '',
-        resume: bool = False,
-        auto_restore: bool = True,
-        **kwargs
-    ) -> 'Engine':
-        '''
-        Initialize and configure the recorder.
-
-        Args:
-            path (str): Custom root path for recordings.
-            name (str): Experiment name.
-            resume (bool): Whether to resume from existing recording.
-            auto_restore (bool): Whether to auto-restore last checkpoint if available.
-            **kwargs: Additional configuration options.
-
-        Returns:
-            Engine: Self for method chaining.
-        '''
-        self._recorder.set_recorder(path=path, name=name, resume=resume, **kwargs)
-        
-        if auto_restore:
-            latest_ckpt = self._recorder.get_latest_checkpoint()
-            if latest_ckpt is not None:
-                state = self._recorder.load_checkpoint(latest_ckpt.name)
-                self._restore_from_checkpoint(state)
-        
-        return self
     
     def _restore_from_checkpoint(self, state: Dict[str, Any]) -> None:
         '''
@@ -122,7 +133,11 @@ class Engine:
             
             for i, model_state in enumerate(space_data.get('models', [])):
                 if i < len(self._moc[space_name]['model']):
-                    self._moc[space_name]['model'][i].load_state_dict(model_state)
+                    target_model = self._moc[space_name]['model'][i]
+                    if isinstance(target_model, DDP):
+                        target_model.module.load_state_dict(model_state)
+                    else:
+                        target_model.load_state_dict(model_state)
             
             for i, opt_state in enumerate(space_data.get('optimizers', [])):
                 if i < len(self._moc[space_name]['optimizer']):
@@ -131,6 +146,9 @@ class Engine:
             for i, sch_state in enumerate(space_data.get('schedules', [])):
                 if i < len(self._moc[space_name]['schedule']):
                     self._moc[space_name]['schedule'][i].load_state_dict(sch_state)
+
+        if self.is_distributed:
+            self.dist.barrier()
     
     @property
     def init_specs(self) -> Dict[str, Any]:
@@ -141,6 +159,12 @@ class Engine:
                 'clip_grad': self.clip_grad,
                 'clip_max_norm': self.clip_max_norm,
                 'device': str(self.device),
+                'distributed': self.is_distributed,
+                'world_size': self.dist.world_size if self.dist is not None else 1,
+                'rank': self.dist.rank if self.dist is not None else 0,
+                'local_rank': self.dist.local_rank if self.dist is not None else 0,
+                'sync_bn': self.sync_bn,
+                'ddp_wrapped': self._ddp_wrapped,
             },
             'spaces': {
                 sp: {
@@ -368,11 +392,152 @@ class Engine:
         return self
 
     def to(self, device: str) -> 'Engine':
-        self.device = torch.device(device)
+        if self.is_distributed:
+            forced = self.dist.device
+            if str(forced) != str(device):
+                self.emit(
+                    'distributed_device_override',
+                    data={'requested': str(device), 'used': str(forced)}
+                )
+            self.device = forced
+        else:
+            self.device = torch.device(device)
         for space in self._moc:
             for i in range(len(self._moc[space]['model'])):
                 self._moc[space]['model'][i] = self._moc[space]['model'][i].to(self.device)
         return self
+
+    def wrap_ddp(self) -> 'Engine':
+        '''
+        Wrap every registered model with DistributedDataParallel.
+
+        Must be called after `add_model` and `to(device)`. In single-process
+        mode this is a no-op (apart from optional SyncBatchNorm conversion).
+        '''
+        if self._ddp_wrapped:
+            return self
+
+        self.emit('before_wrap_ddp', data={'distributed': self.is_distributed})
+
+        for space_name, space_data in self._moc.items():
+            for i, model in enumerate(space_data['model']):
+                if isinstance(model, DDP):
+                    continue
+
+                if self.sync_bn and self.is_distributed:
+                    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+                    space_data['model'][i] = model
+
+                if not self.is_distributed:
+                    continue
+
+                ddp_kwargs = dict(self.ddp_kwargs)
+                ddp_kwargs.setdefault('find_unused_parameters', self.find_unused_parameters)
+
+                if self.device.type == 'cuda':
+                    ddp_kwargs.setdefault('device_ids', [self.dist.local_rank])
+                    ddp_kwargs.setdefault('output_device', self.dist.local_rank)
+
+                space_data['model'][i] = DDP(model, **ddp_kwargs)
+
+        self._ddp_wrapped = True
+        self.emit('after_wrap_ddp', data={'distributed': self.is_distributed})
+        return self
+
+    def make_distributed_sampler(
+        self,
+        dataset: torch.utils.data.Dataset,
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ) -> Optional[DistributedSampler]:
+        '''
+        Build a DistributedSampler bound to the current process group.
+
+        Returns None when distributed mode is disabled.
+        '''
+        if not self.is_distributed:
+            return None
+        return DistributedSampler(
+            dataset,
+            num_replicas=self.dist.world_size,
+            rank=self.dist.rank,
+            shuffle=shuffle,
+            drop_last=drop_last,
+        )
+
+    def prepare_dataloader(
+        self,
+        dataloader: DataLoader,
+        shuffle: bool = True,
+        drop_last: Optional[bool] = None,
+    ) -> DataLoader:
+        '''
+        Wrap an existing DataLoader with a DistributedSampler. In single-process
+        mode the original loader is returned unchanged.
+        '''
+        if not self.is_distributed:
+            return dataloader
+
+        dataset = dataloader.dataset
+        sampler = self.make_distributed_sampler(
+            dataset,
+            shuffle=shuffle,
+            drop_last=bool(drop_last) if drop_last is not None else False,
+        )
+
+        new_loader = DataLoader(
+            dataset,
+            batch_size=dataloader.batch_size,
+            sampler=sampler,
+            num_workers=dataloader.num_workers,
+            collate_fn=dataloader.collate_fn,
+            pin_memory=dataloader.pin_memory,
+            drop_last=dataloader.drop_last if drop_last is None else drop_last,
+            timeout=dataloader.timeout,
+            worker_init_fn=dataloader.worker_init_fn,
+            persistent_workers=getattr(dataloader, 'persistent_workers', False),
+            prefetch_factor=getattr(dataloader, 'prefetch_factor', 2) if dataloader.num_workers > 0 else None,
+        )
+        return new_loader
+
+    def _ensure_setup(self) -> None:
+        '''
+        Lazily move every registered model to the current device and wrap it
+        with DDP. Called automatically at the start of `fit_once`. Idempotent.
+        '''
+        if self._ddp_wrapped:
+            return
+
+        for space_data in self._moc.values():
+            for i, m in enumerate(space_data['model']):
+                if isinstance(m, DDP):
+                    continue
+                space_data['model'][i] = m.to(self.device)
+
+        self.wrap_ddp()
+
+    def _maybe_prepare_dataloader(self, dataloader: DataLoader) -> DataLoader:
+        '''
+        Replace the loader's sampler with a DistributedSampler when running in
+        distributed mode. The result is cached by loader identity so repeated
+        epochs reuse the same wrapped loader (preserving worker processes when
+        `persistent_workers=True`).
+        '''
+        if not self.is_distributed:
+            return dataloader
+
+        sampler = getattr(dataloader, 'sampler', None)
+        if isinstance(sampler, DistributedSampler):
+            return dataloader
+
+        cached = self._prepared_loaders.get(id(dataloader))
+        if cached is not None:
+            return cached
+
+        shuffle = isinstance(sampler, RandomSampler) or self.is_training
+        prepared = self.prepare_dataloader(dataloader, shuffle=shuffle)
+        self._prepared_loaders[id(dataloader)] = prepared
+        return prepared
 
     def step_schedules(self, space: Union[str, None] = None) -> 'Engine':
         '''
@@ -446,21 +611,51 @@ class Engine:
         self.data, self.target = process_batch_data(batch, self.device)
         self.emit('end_process_batch_data')
 
+    def _is_sync_step(self) -> bool:
+        '''
+        Whether the current micro step triggers a gradient synchronization.
+        '''
+        return (self.step_micro % self.accumulate_grad_batches) == 0
+
+    def _ddp_no_sync_stack(self, target_spaces: List[str]) -> ExitStack:
+        '''
+        Build an ExitStack that activates `no_sync()` on every DDP-wrapped
+        model in the target spaces. Used to skip gradient all-reduce on
+        non-sync micro steps when accumulating gradients.
+        '''
+        stack = ExitStack()
+        if not self.is_distributed:
+            return stack
+        for sp in target_spaces:
+            if sp not in self._moc:
+                continue
+            for model in self._moc[sp]['model']:
+                if isinstance(model, DDP):
+                    stack.enter_context(model.no_sync())
+        return stack
+
     def update_loss(self, loss: Union[torch.Tensor, dict], space: str = 'main') -> 'Engine':
+        sync = self._is_sync_step()
+
         if isinstance(loss, dict):
-            for sp, res in loss.items():
-                losses = res.get('losses', [])
-                if not losses: continue
-                total = sum(losses) / self.accumulate_grad_batches
-                self.emit('before_update_loss', data={'loss': total, 'space': sp})
-                self.scaler.scale(total).backward()
-                self.emit('after_update_loss', data={'loss': total, 'space': sp})
+            target_spaces = list(loss.keys())
+            no_sync_ctx = self._ddp_no_sync_stack(target_spaces) if not sync else ExitStack()
+            with no_sync_ctx:
+                for sp, res in loss.items():
+                    losses = res.get('losses', [])
+                    if not losses: continue
+                    total = sum(losses) / self.accumulate_grad_batches
+                    self.emit('before_update_loss', data={'loss': total, 'space': sp})
+                    self.scaler.scale(total).backward()
+                    self.emit('after_update_loss', data={'loss': total, 'space': sp})
         else:
-            loss = loss / self.accumulate_grad_batches
-            self.emit('before_update_loss', data={'loss': loss, 'space': space})
-            self.scaler.scale(loss).backward()
-            self.emit('after_update_loss', data={'loss': loss, 'space': space})
-            self.loss = loss
+            no_sync_ctx = self._ddp_no_sync_stack([space]) if not sync else ExitStack()
+            with no_sync_ctx:
+                loss = loss / self.accumulate_grad_batches
+                self.emit('before_update_loss', data={'loss': loss, 'space': space})
+                self.scaler.scale(loss).backward()
+                self.emit('after_update_loss', data={'loss': loss, 'space': space})
+                self.loss = loss
         return self
 
     def forward_pass(self, space: Union[str, None] = None) -> dict:
@@ -525,6 +720,13 @@ class Engine:
         return results
 
     def fit_once(self, dataloader: torch.utils.data.DataLoader) -> Generator:
+        self._ensure_setup()
+        dataloader = self._maybe_prepare_dataloader(dataloader)
+
+        sampler = getattr(dataloader, 'sampler', None)
+        if isinstance(sampler, DistributedSampler):
+            sampler.set_epoch(self.epoch)
+
         self.emit('start_epoch', data=dataloader)
         self.step_global_in_batch = 0
         for step, batch in enumerate(dataloader):
@@ -561,8 +763,14 @@ class Engine:
         '''
         spaces_state = {}
         for space_name, space_data in self._moc.items():
+            models_state = []
+            for m in space_data['model']:
+                if isinstance(m, DDP):
+                    models_state.append(m.module.state_dict())
+                else:
+                    models_state.append(m.state_dict())
             spaces_state[space_name] = {
-                'models': [m.state_dict() for m in space_data['model']],
+                'models': models_state,
                 'optimizers': [o.state_dict() for o in space_data['optimizer']],
                 'schedules': [s.state_dict() for s in space_data.get('schedule', []) if hasattr(s, 'state_dict')],
             }
